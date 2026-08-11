@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neutron-imaging-gui"
+version = "0.1.0"
+description = "Interactive neutron-imaging data reduction workflow."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyqtgraph",
+    "qtpy",
+    "tifffile",
+    "neutron-imaging-tools",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[project.scripts]
+neutron-imaging-gui = "neutron_imaging_gui.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
