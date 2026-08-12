@@ -1140,14 +1140,16 @@ class ImagePreview(QtWidgets.QWidget):
 
 
 class StepList(QtWidgets.QListWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, titles=None):
         super().__init__(parent)
         self.setObjectName("stepList")
         self.setFixedWidth(194)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.setSpacing(4)
-        for number, title in enumerate(("Select inputs", "Prepare images", "Normalize", "Review results"), 1):
+        titles = titles or ("Select inputs", "Prepare images", "Normalize", "Review results")
+        for number, title in enumerate(titles, 1):
             item = QtWidgets.QListWidgetItem(f"{number}   {title}")
+            item.setToolTip(str(title))
             item.setSizeHint(QtCore.QSize(160, 45))
             self.addItem(item)
         self.setCurrentRow(0)

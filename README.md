@@ -36,6 +36,32 @@ defaults to four processes; native worker threads are limited to avoid CPU
 oversubscription. The progress bar and lower processing log track individual file
 loads as well as each merge, gamma-filter, transmission, and attenuation stage.
 
+## Tomography workspace
+
+The top-level **Tomography** tab provides a separate preparation and
+reconstruction-testing workflow. It accepts either a dataset directory with
+projection/reference patterns or explicit TIFF lists, inspects angle metadata,
+and supports a manual angle-range fallback. Crop and dose ROIs are stored in
+native detector pixels even when the interactive previews are binned.
+
+Tomography preparation follows the NIT sequence: reference merging, adaptive
+outlier filtering, optional white-field alignment, white/dark normalization,
+optional beam-dose normalization, stripe removal, and attenuation conversion.
+The preview selector retains reference, projection, and sinogram checkpoints.
+
+When LEAP is available, the workspace can estimate center/tilt, compare tilt
+correction, test FBP or iterative reconstruction methods, and run a guarded,
+restartable chunked volume reconstruction. Without LEAP, TomoPy
+gridrec/FBP/SIRT trials remain available for screening and are explicitly
+labeled as non-equivalent to the LEAP cluster result.
+
+Tomography recipes use the versioned
+`neutron-imaging-gui/tomography-recipe-v1` JSON schema. They preserve local and
+cluster path mappings, source summaries, loading/preparation settings, native
+ROIs and crops, geometry, the promoted reconstruction trial, and full-volume
+chunk/export parameters. Importing a recipe restores controls but never loads
+data or starts processing automatically.
+
 ## Development launch
 
 From this checkout, using the beamline environment:

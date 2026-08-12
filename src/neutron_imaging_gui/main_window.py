@@ -23,6 +23,7 @@ from .exporting import (
 )
 from .widgets import FileSelectionCard, ImagePreview, StepList
 from .workers import ReductionQueue
+from .tomography_workspace import TomographyWorkspace
 
 
 log = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._shared_roi = (10, 10, 100, 100)
         self._group_rois: dict[str, tuple[int, int, int, int]] = {}
         self._last_directory = Path.home()
+        self._tomography_busy = False
         self._queue = ReductionQueue(self)
         self._build_ui()
         self._connect_signals()
@@ -68,8 +70,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_run_state()
 
     def _build_ui(self) -> None:
+        self.workspace_tabs = QtWidgets.QTabWidget()
+        self.setCentralWidget(self.workspace_tabs)
         central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
+        self.workspace_tabs.addTab(central, "Radiography")
         root = QtWidgets.QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -164,6 +168,9 @@ class MainWindow(QtWidgets.QMainWindow):
         footer_layout.addWidget(self.cancel_button)
         footer_layout.addWidget(self.run_button)
         root.addWidget(footer)
+
+        self.tomography = TomographyWorkspace(initial_directory=self._last_directory)
+        self.workspace_tabs.addTab(self.tomography, "Tomography")
 
     def _page(self, title: str, intro: str):
         scroll = QtWidgets.QScrollArea()
@@ -357,12 +364,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue.succeeded.connect(self._job_succeeded)
         self._queue.failed.connect(self._job_failed)
         self._queue.cancelled.connect(self._job_cancelled)
+        self._queue.queueChanged.connect(self._radiography_queue_changed)
+        self.tomography.busyChanged.connect(self._tomography_busy_changed)
+        self.tomography.directoryChanged.connect(self._remember_directory)
 
     def _remember_directory(self, directory) -> None:
         path = Path(directory).expanduser().resolve()
         self._last_directory = path
         for card in (self.white_card, self.dark_card, self.sample_card):
             card.set_last_directory(path)
+        self.tomography.set_last_directory(path)
+
+    def _radiography_queue_changed(self, count):
+        self.tomography.set_external_busy(bool(count))
+
+    def _tomography_busy_changed(self, busy):
+        self._tomography_busy = bool(busy)
+        self._update_run_state()
 
     def _build_config(self) -> ReductionConfig:
         return ReductionConfig(
@@ -393,7 +411,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_run_state(self):
         ready = bool(self.white_card.paths and self.dark_card.paths and self.sample_card.paths)
-        self.run_button.setEnabled(ready and self._current_job_id is None)
+        self.run_button.setEnabled(
+            ready and self._current_job_id is None and not self._tomography_busy
+        )
         if self._current_job_id is None and self._result is None:
             self.status_label.setText(
                 "Ready to process selected images." if ready else "Select input images to begin."
@@ -743,5 +763,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.preview.prepare_close()
+        self.tomography.prepare_close()
         self._queue.shutdown()
         super().closeEvent(event)
