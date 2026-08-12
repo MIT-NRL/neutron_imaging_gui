@@ -73,9 +73,13 @@ class ProcessingTests(unittest.TestCase):
             merge_method="median",
             gamma_filter=False,
         )
-        product = run_reduction(config).products["sample_uid12345"]
+        result = run_reduction(config)
+        product = result.products["sample_uid12345"]
         np.testing.assert_allclose(product.transmission, 0.5)
         np.testing.assert_allclose(product.attenuation, -np.log(0.5), rtol=1e-6)
+        self.assertIsNotNone(result.processing_started_utc)
+        self.assertIsNotNone(result.processing_finished_utc)
+        self.assertGreaterEqual(result.processing_elapsed_seconds, 0.0)
 
     def test_dose_normalization_matches_open_beam_roi(self):
         shape = (6, 6)
@@ -149,6 +153,45 @@ class ProcessingTests(unittest.TestCase):
         self.assertIn("Loaded white.tif", messages)
         self.assertIn("Merged white field", messages)
         self.assertIn("Transmission ready for sample", messages)
+
+    def test_multiprocessing_matches_serial_and_reports_image_progress(self):
+        shape = (12, 13)
+        white = tuple(
+            _write(self.temp_path / f"white_{i}.tif", np.full(shape, 110.0 + i))
+            for i in range(2)
+        )
+        dark = tuple(
+            _write(self.temp_path / f"dark_{i}.tif", np.full(shape, 10.0 + i))
+            for i in range(2)
+        )
+        samples = tuple(
+            _write(self.temp_path / f"sample_{name}_{i:04d}.tif", np.full(shape, value + i))
+            for name, value in (("a", 60.0), ("b", 35.0))
+            for i in range(2)
+        )
+        base = dict(
+            white_files=white,
+            dark_files=dark,
+            sample_files=samples,
+            merge_method="median",
+            gamma_filter=False,
+        )
+        serial = run_reduction(ReductionConfig(**base))
+        updates = []
+        parallel = run_reduction(
+            ReductionConfig(**base, use_multiprocessing=True, process_count=2),
+            progress=lambda *args: updates.append(args),
+        )
+        self.assertEqual(list(parallel.products), ["sample_a", "sample_b"])
+        for name in serial.products:
+            np.testing.assert_allclose(
+                parallel.products[name].attenuation,
+                serial.products[name].attenuation,
+            )
+        self.assertTrue(any("Starting 2 background process" in item[3] for item in updates))
+        loaded = [item for item in updates if item[3].startswith("Loaded ")]
+        self.assertEqual(len(loaded), 8)
+        self.assertEqual(updates[-1][1], updates[-1][2])
 
 
 if __name__ == "__main__":

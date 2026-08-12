@@ -9,9 +9,11 @@ description = "Interactive neutron-imaging data reduction workflow."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "matplotlib",
     "numpy",
     "pyqtgraph",
     "qtpy",
+    "threadpoolctl",
     "tifffile",
     "neutron-imaging-tools",
 ]
