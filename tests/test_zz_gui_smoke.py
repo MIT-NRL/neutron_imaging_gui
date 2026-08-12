@@ -10,9 +10,15 @@ import tifffile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from qtpy import QtCore, QtWidgets
+from qtpy import QtCore, QtGui, QtWidgets
 
 from neutron_imaging_gui.main_window import MainWindow
+from neutron_imaging_gui.theme import (
+    THEME_MODE_SETTINGS_KEY,
+    apply_theme,
+    saved_theme_mode,
+    settings as theme_settings,
+)
 from neutron_imaging_gui.export_dialogs import BatchExportDialog, CurrentImageExportDialog
 from neutron_imaging_gui.processing import ReductionConfig
 from neutron_imaging_gui.workers import ReductionQueue
@@ -41,6 +47,41 @@ class GuiSmokeTests(unittest.TestCase):
         window.multiprocessing_check.setChecked(False)
         self.assertFalse(window.process_count_spin.isEnabled())
         window.close()
+
+    def test_theme_menu_switches_persists_and_recolors_plots(self):
+        app_settings = theme_settings()
+        had_setting = app_settings.contains(THEME_MODE_SETTINGS_KEY)
+        previous_value = app_settings.value(THEME_MODE_SETTINGS_KEY)
+        previous_mode = saved_theme_mode()
+        window = MainWindow()
+        try:
+            window.set_theme_mode("dark")
+            self.assertTrue(window.theme_actions["dark"].isChecked())
+            self.assertEqual(saved_theme_mode(), "dark")
+            self.assertLess(window.palette().color(QtGui.QPalette.Window).lightness(), 128)
+            dark_background = window.preview.histogram_plot.backgroundBrush().color()
+            self.assertLess(dark_background.lightness(), 128)
+            dark_ticks = window.preview.view.getView().getAxis("bottom").textPen().color()
+            self.assertGreater(dark_ticks.lightness(), 128)
+
+            window.set_theme_mode("light")
+            self.assertTrue(window.theme_actions["light"].isChecked())
+            self.assertEqual(saved_theme_mode(), "light")
+            self.assertGreaterEqual(
+                window.palette().color(QtGui.QPalette.Window).lightness(), 128
+            )
+            light_background = window.preview.histogram_plot.backgroundBrush().color()
+            self.assertGreaterEqual(light_background.lightness(), 128)
+            light_ticks = window.preview.view.getView().getAxis("bottom").textPen().color()
+            self.assertLess(light_ticks.lightness(), 128)
+        finally:
+            if had_setting:
+                app_settings.setValue(THEME_MODE_SETTINGS_KEY, previous_value)
+            else:
+                app_settings.remove(THEME_MODE_SETTINGS_KEY)
+            app_settings.sync()
+            apply_theme(previous_mode, root=window)
+            window.close()
         self.app.processEvents()
 
     def test_input_dialogs_start_in_home_and_remember_selection(self):

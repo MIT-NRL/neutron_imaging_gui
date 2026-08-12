@@ -22,6 +22,10 @@ sample group. Basic analysis overlays include an editable distance-measurement
 line, physical pixel-size calibration from a known length, and a rectangular ROI
 for live vertical-to-X or horizontal-to-Y mean/sum profiles.
 
+The View menu provides persistent Light, Dark, and System themes. System mode
+detects the desktop preference when the application starts, while explicit theme
+changes update the Qt interface and image-analysis plots immediately.
+
 Current images can be exported as cropped or full-resolution float TIFFs,
 image-only PNGs, or Matplotlib-styled PNG figures with an optional colorbar.
 Batch export can organize background references, combined samples, transmission,

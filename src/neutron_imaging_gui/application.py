@@ -9,6 +9,7 @@ import sys
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .main_window import MainWindow
+from .theme import apply_theme, saved_theme_mode
 
 
 def _configure_high_dpi() -> None:
@@ -33,8 +34,8 @@ def main(argv=None) -> int:
     app.setOrganizationName("MIT-NRL")
     app.setStyle("Fusion")
     app.setWindowIcon(QtGui.QIcon())
+    apply_theme(saved_theme_mode())
 
     window = MainWindow(initial_sample_paths=args.paths)
     window.show()
     return int(app.exec_())
-

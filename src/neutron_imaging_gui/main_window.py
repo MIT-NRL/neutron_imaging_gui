@@ -24,6 +24,7 @@ from .exporting import (
 from .widgets import FileSelectionCard, ImagePreview, StepList
 from .workers import ReductionQueue
 from .tomography_workspace import TomographyWorkspace
+from .theme import apply_theme, saved_theme_mode
 
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ STYLE = """
 QMainWindow { background: palette(window); }
 QFrame#header { background: palette(base); border-bottom: 1px solid palette(mid); }
 QLabel#title { font-size: 22px; font-weight: 600; }
-QLabel#subtitle, QLabel[muted="true"] { color: #5f6b76; }
+QLabel#subtitle, QLabel[muted="true"] { color: palette(mid); }
 QListWidget#stepList { border: none; background: palette(base); padding: 8px; }
 QListWidget#stepList::item { border-radius: 6px; padding: 8px; }
 QListWidget#stepList::item:selected { background: #2f6f9f; color: white; }
@@ -64,6 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tomography_busy = False
         self._queue = ReductionQueue(self)
         self._build_ui()
+        self._build_menus()
         self._connect_signals()
         if initial_sample_paths:
             self.sample_card.add_paths(initial_sample_paths)
@@ -171,6 +173,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tomography = TomographyWorkspace(initial_directory=self._last_directory)
         self.workspace_tabs.addTab(self.tomography, "Tomography")
+
+    def _build_menus(self) -> None:
+        view_menu = self.menuBar().addMenu("View")
+        theme_menu = view_menu.addMenu("Theme")
+        self.theme_action_group = QtGui.QActionGroup(theme_menu)
+        self.theme_action_group.setExclusive(True)
+        self.theme_actions = {}
+        current = saved_theme_mode()
+        for label, mode, tooltip in (
+            ("Light", "light", "Always use the light application theme."),
+            ("Dark", "dark", "Always use the dark application theme."),
+            ("System", "system", "Follow the desktop theme when the application starts."),
+        ):
+            action = theme_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setToolTip(tooltip)
+            action.setChecked(mode == current)
+            action.triggered.connect(
+                lambda checked=False, selected=mode: self.set_theme_mode(selected)
+            )
+            self.theme_action_group.addAction(action)
+            self.theme_actions[mode] = action
+
+    def set_theme_mode(self, mode: str) -> None:
+        apply_theme(mode, persist=True, root=self)
+        # Qt resolves palette(...) references when a stylesheet is polished.
+        # Reapply it so live theme changes update styled headers and navigation.
+        self.setStyleSheet("")
+        self.setStyleSheet(STYLE)
+        for key, action in self.theme_actions.items():
+            action.setChecked(key == mode)
 
     def _page(self, title: str, intro: str):
         scroll = QtWidgets.QScrollArea()
