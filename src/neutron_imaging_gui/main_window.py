@@ -701,7 +701,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     metadata if options.embed_tiff_metadata else None,
                 )
             else:
-                levels = self.preview.levels() if options.use_viewer_levels else None
+                levels = (
+                    self.preview.levels()
+                    if options.use_viewer_levels
+                    else options.manual_levels
+                )
                 write_png(
                     options.path,
                     exported,

@@ -116,8 +116,24 @@ class GuiSmokeTests(unittest.TestCase):
                 (40, 30),
             )
             self.assertEqual(current.preview_figure.axes[0].images[0].get_cmap().name, "gray")
+            self.assertEqual(
+                current.preview_figure.axes[0].images[0].get_clim(),
+                (100.0, 10_000.0),
+            )
             self.assertFalse(current.preview_figure.axes[0].axison)
             self.assertEqual(len(current.preview_figure.axes), 1)
+
+            current.viewer_levels_check.setChecked(False)
+            self.assertTrue(current.minimum_spin.isEnabled())
+            self.assertTrue(current.maximum_spin.isEnabled())
+            current.minimum_spin.setValue(500.0)
+            current.maximum_spin.setValue(5_000.0)
+            current._refresh_preview()
+            self.assertEqual(
+                current.preview_figure.axes[0].images[0].get_clim(),
+                (500.0, 5_000.0),
+            )
+            self.assertEqual(current.options().manual_levels, (500.0, 5_000.0))
 
             current.format_combo.setCurrentIndex(1)
             current._refresh_preview()

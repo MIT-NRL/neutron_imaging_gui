@@ -18,6 +18,7 @@ class CurrentExportOptions:
     crop_bounds: tuple[int, int, int, int] | None
     cmap: str
     use_viewer_levels: bool
+    manual_levels: tuple[float, float]
     colorbar: bool
     title: str
     dpi: int
@@ -136,12 +137,35 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
             self.colormap_combo.setCurrentIndex(cmap_index)
         self.viewer_levels_check = QtWidgets.QCheckBox("Use current viewer min/max")
         self.viewer_levels_check.setChecked(True)
+        finite = self._image[np.isfinite(self._image)]
+        if viewer_levels is not None:
+            initial_low, initial_high = (float(value) for value in viewer_levels)
+        elif finite.size:
+            initial_low, initial_high = (
+                float(value) for value in np.percentile(finite, (1.0, 99.7))
+            )
+        else:
+            initial_low, initial_high = 0.0, 1.0
+        if not np.isfinite(initial_low):
+            initial_low = 0.0
+        if not np.isfinite(initial_high) or initial_high <= initial_low:
+            initial_high = initial_low + 1.0
+        manual_levels_row = QtWidgets.QWidget()
+        manual_levels_layout = QtWidgets.QHBoxLayout(manual_levels_row)
+        manual_levels_layout.setContentsMargins(0, 0, 0, 0)
+        self.minimum_spin = self._level_spin(initial_low)
+        self.maximum_spin = self._level_spin(initial_high)
+        manual_levels_layout.addWidget(QtWidgets.QLabel("Min"))
+        manual_levels_layout.addWidget(self.minimum_spin)
+        manual_levels_layout.addWidget(QtWidgets.QLabel("Max"))
+        manual_levels_layout.addWidget(self.maximum_spin)
         self.colorbar_check = QtWidgets.QCheckBox("Include colorbar")
         self.colorbar_check.setChecked(True)
         self.title_edit = QtWidgets.QLineEdit(str(image_name))
         self.dpi_spin = self._integer_spin(72, 600, 150)
         appearance_form.addRow("Color map", self.colormap_combo)
         appearance_form.addRow(self.viewer_levels_check)
+        appearance_form.addRow("Manual range", manual_levels_row)
         appearance_form.addRow(self.colorbar_check)
         appearance_form.addRow("Figure title", self.title_edit)
         appearance_form.addRow("DPI", self.dpi_spin)
@@ -201,9 +225,13 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
             spin.valueChanged.connect(self._schedule_preview)
         self.colormap_combo.currentIndexChanged.connect(self._schedule_preview)
         self.viewer_levels_check.toggled.connect(self._schedule_preview)
+        self.viewer_levels_check.toggled.connect(self._set_level_controls_enabled)
+        self.minimum_spin.valueChanged.connect(self._schedule_preview)
+        self.maximum_spin.valueChanged.connect(self._schedule_preview)
         self.colorbar_check.toggled.connect(self._schedule_preview)
         self.title_edit.textChanged.connect(self._schedule_preview)
         self._set_crop_controls_enabled(False)
+        self._set_level_controls_enabled(True)
         self._format_changed()
         self._refresh_preview()
 
@@ -212,6 +240,15 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
         spin = QtWidgets.QSpinBox()
         spin.setRange(int(minimum), int(maximum))
         spin.setValue(int(value))
+        return spin
+
+    @staticmethod
+    def _level_spin(value):
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(-1.0e15, 1.0e15)
+        spin.setDecimals(6)
+        spin.setValue(float(value))
+        spin.setKeyboardTracking(False)
         return spin
 
     def _format_changed(self, *_args):
@@ -223,7 +260,7 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
         styled = kind == "png_styled"
         image_png = kind == "png_image"
         self.colormap_combo.setEnabled(image_png or styled)
-        self.viewer_levels_check.setEnabled(image_png or styled)
+        self.viewer_levels_check.setEnabled(True)
         self.colorbar_check.setEnabled(styled)
         self.title_edit.setEnabled(styled)
         self.dpi_spin.setEnabled(styled)
@@ -233,7 +270,11 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
         elif image_png:
             note = "Image-only PNG preview matches the selected color map and levels, without figure decoration."
         else:
-            note = "TIFF preview is grayscale without decoration; the exported TIFF retains full-resolution numeric data."
+            note = (
+                "TIFF preview is grayscale without decoration and uses the selected min/max "
+                "for visibility. The exported TIFF retains the original full-resolution "
+                "numeric data."
+            )
         self.preview_note.setText(note)
         self._schedule_preview()
 
@@ -267,6 +308,23 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
         ):
             widget.setEnabled(bool(enabled))
 
+    def _set_level_controls_enabled(self, use_viewer_levels):
+        manual = not bool(use_viewer_levels)
+        self.minimum_spin.setEnabled(manual)
+        self.maximum_spin.setEnabled(manual)
+
+    def _selected_levels(self):
+        if self.viewer_levels_check.isChecked() and self._viewer_levels is not None:
+            return tuple(float(value) for value in self._viewer_levels)
+        return self._manual_levels()
+
+    def _manual_levels(self):
+        low = float(self.minimum_spin.value())
+        high = float(self.maximum_spin.value())
+        if high <= low:
+            high = low + max(1.0e-6, abs(low) * 1.0e-9)
+        return low, high
+
     def _schedule_preview(self, *_args):
         self._preview_timer.start()
 
@@ -287,16 +345,16 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
         displayed = cropped[::stride, ::stride]
         extent = (0, width, height, 0) if stride > 1 else None
         kind = str(self.format_combo.currentData())
+        levels = self._selected_levels()
         if kind == "tiff":
             populate_raster_preview(
                 self.preview_figure,
                 displayed,
                 cmap="gray",
-                levels=None,
+                levels=levels,
                 extent=extent,
             )
         elif kind == "png_image":
-            levels = self._viewer_levels if self.viewer_levels_check.isChecked() else None
             populate_raster_preview(
                 self.preview_figure,
                 displayed,
@@ -305,7 +363,6 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
                 extent=extent,
             )
         else:
-            levels = self._viewer_levels if self.viewer_levels_check.isChecked() else None
             populate_styled_figure(
                 self.preview_figure,
                 displayed,
@@ -347,6 +404,7 @@ class CurrentImageExportDialog(QtWidgets.QDialog):
             crop_bounds=crop,
             cmap=str(self.colormap_combo.currentData()),
             use_viewer_levels=self.viewer_levels_check.isChecked(),
+            manual_levels=self._manual_levels(),
             colorbar=self.colorbar_check.isChecked(),
             title=self.title_edit.text().strip(),
             dpi=self.dpi_spin.value(),
