@@ -1,13 +1,22 @@
+import gc
 import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
+import tifffile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from qtpy import QtCore, QtWidgets
 
 from neutron_imaging_gui.main_window import MainWindow
+from neutron_imaging_gui.export_dialogs import BatchExportDialog, CurrentImageExportDialog
+from neutron_imaging_gui.processing import ReductionConfig
+from neutron_imaging_gui.workers import ReductionQueue
+from neutron_imaging_gui.widgets import integrated_profile
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -15,13 +24,236 @@ class GuiSmokeTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def tearDown(self):
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.app.processEvents()
+        gc.collect()
+
     def test_main_window_builds(self):
         window = MainWindow()
         self.assertEqual(window.pages.count(), 4)
         self.assertEqual(window.windowTitle(), "Neutron Imaging Reduction")
         self.assertEqual((window.width(), window.height()), (1500, 850))
+        self.assertTrue(window.multiprocessing_check.isChecked())
+        self.assertEqual(
+            window.process_count_spin.value(), min(4, window.process_count_spin.maximum())
+        )
+        window.multiprocessing_check.setChecked(False)
+        self.assertFalse(window.process_count_spin.isEnabled())
         window.close()
         self.app.processEvents()
+
+    def test_input_dialogs_start_in_home_and_remember_selection(self):
+        window = MainWindow()
+        self.assertEqual(window.white_card._last_directory, str(Path.home()))
+        self.assertEqual(window.dark_card._last_directory, str(Path.home()))
+        self.assertEqual(window.sample_card._last_directory, str(Path.home()))
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "white.tif"
+            tifffile.imwrite(image_path, np.ones((4, 4), dtype=np.float32))
+            window.white_card.add_paths([image_path])
+            self.assertEqual(Path(window.white_card._last_directory), Path(directory).resolve())
+            self.assertEqual(Path(window.dark_card._last_directory), Path(directory).resolve())
+            self.assertEqual(Path(window.sample_card._last_directory), Path(directory).resolve())
+            self.assertEqual(window._last_directory, Path(directory).resolve())
+
+            dark_directory = Path(directory) / "dark"
+            dark_directory.mkdir()
+            dark_path = dark_directory / "dark.tif"
+            tifffile.imwrite(dark_path, np.zeros((4, 4), dtype=np.float32))
+            with mock.patch.object(
+                QtWidgets.QFileDialog,
+                "getOpenFileNames",
+                return_value=([str(dark_path)], "TIFF images (*.tif *.tiff)"),
+            ) as chooser:
+                window.dark_card._choose_files()
+            self.assertEqual(Path(chooser.call_args.args[2]), Path(directory).resolve())
+            self.assertEqual(window._last_directory, dark_directory.resolve())
+            self.assertTrue(
+                all(
+                    Path(card._last_directory) == dark_directory.resolve()
+                    for card in (window.white_card, window.dark_card, window.sample_card)
+                )
+            )
+        window.close()
+        self.app.processEvents()
+
+    def test_integrated_profiles_use_expected_axes_and_statistics(self):
+        image = np.arange(20, dtype=float).reshape(4, 5)
+        x, vertical_mean, label = integrated_profile(
+            image, (1, 1, 3, 2), integration="vertical", statistic="mean"
+        )
+        np.testing.assert_array_equal(x, [1, 2, 3])
+        np.testing.assert_allclose(vertical_mean, np.mean(image[1:3, 1:4], axis=0))
+        self.assertEqual(label, "X pixel")
+
+        y, horizontal_sum, label = integrated_profile(
+            image, (1, 1, 3, 2), integration="horizontal", statistic="sum"
+        )
+        np.testing.assert_array_equal(y, [1, 2])
+        np.testing.assert_allclose(horizontal_sum, np.sum(image[1:3, 1:4], axis=1))
+        self.assertEqual(label, "Y pixel")
+
+    def test_export_option_dialog_defaults_and_crop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            current = CurrentImageExportDialog(
+                image=np.arange(20_000, dtype=np.float32).reshape(100, 200),
+                image_name="sample_transmission",
+                initial_directory=directory,
+                colormap="magma",
+                viewer_levels=(100.0, 10_000.0),
+                profile_bounds=(10, 20, 30, 40),
+            )
+            self.assertEqual(current.format_combo.currentData(), "tiff")
+            self.assertTrue(current.embed_metadata_check.isChecked())
+            self.assertTrue(current.companion_json_check.isChecked())
+            current.use_profile_roi_button.click()
+            self.assertEqual(current.options().crop_bounds, (10, 20, 30, 40))
+            current._refresh_preview()
+            current.preview_canvas.draw()
+            self.assertEqual(
+                current.preview_figure.axes[0].images[0].get_array().shape,
+                (40, 30),
+            )
+            self.assertEqual(current.preview_figure.axes[0].images[0].get_cmap().name, "gray")
+            self.assertFalse(current.preview_figure.axes[0].axison)
+            self.assertEqual(len(current.preview_figure.axes), 1)
+
+            current.format_combo.setCurrentIndex(1)
+            current._refresh_preview()
+            self.assertEqual(
+                current.preview_figure.axes[0].images[0].get_cmap().name,
+                "magma",
+            )
+            self.assertFalse(current.preview_figure.axes[0].axison)
+            self.assertEqual(len(current.preview_figure.axes), 1)
+
+            current.format_combo.setCurrentIndex(2)
+            current._refresh_preview()
+            current.preview_canvas.draw()
+            self.assertEqual(len(current.preview_figure.axes), 2)
+            self.assertTrue(current.preview_figure.axes[0].axison)
+            renderer = current.preview_canvas.get_renderer()
+            image_height = current.preview_figure.axes[0].get_window_extent(renderer).height
+            colorbar_height = current.preview_figure.axes[1].get_window_extent(renderer).height
+            self.assertAlmostEqual(image_height, colorbar_height, places=6)
+            self.assertEqual(current.options().format, "png_styled")
+            self.assertEqual(current.options().path.suffix, ".png")
+            current.close()
+
+            batch = BatchExportDialog(initial_directory=directory)
+            options = batch.options()
+            self.assertEqual(
+                options.categories,
+                ("background", "combined", "transmission", "attenuation"),
+            )
+            self.assertTrue(options.use_subfolders)
+            self.assertTrue(options.embed_tiff_metadata)
+            self.assertTrue(options.companion_json)
+            batch.close()
+
+    def test_measurement_calibration_and_profile_roi(self):
+        class MeasureEvent:
+            def __init__(self, event_type, scene_position):
+                self._event_type = event_type
+                self._scene_position = scene_position
+                self.accepted = False
+
+            def type(self):
+                return self._event_type
+
+            @staticmethod
+            def button():
+                return QtCore.Qt.LeftButton
+
+            def scenePos(self):
+                return self._scene_position
+
+            def accept(self):
+                self.accepted = True
+
+        window = MainWindow()
+        window.preview.set_image(np.arange(200, dtype=np.float32).reshape(10, 20))
+        window.preview.measure_check.setChecked(True)
+        self.assertFalse(window.preview.measure_line.isVisible())
+        self.assertIsNone(window.preview.measurement_length_px())
+        view_box = window.preview.view.getView().getViewBox()
+        start = view_box.mapViewToScene(QtCore.QPointF(5.0, 5.0))
+        end = view_box.mapViewToScene(QtCore.QPointF(15.0, 5.0))
+        for event_type, position in (
+            (QtCore.QEvent.GraphicsSceneMousePress, start),
+            (QtCore.QEvent.GraphicsSceneMouseMove, end),
+            (QtCore.QEvent.GraphicsSceneMouseRelease, end),
+        ):
+            event = MeasureEvent(event_type, position)
+            self.assertTrue(window.preview.eventFilter(window.preview._measure_scene, event))
+            self.assertTrue(event.accepted)
+        self.assertTrue(window.preview.measure_line.isVisible())
+        self.assertAlmostEqual(window.preview.measurement_length_px(), 10.0)
+        self.assertAlmostEqual(window.preview.set_calibration_from_line(1000.0), 100.0)
+        self.assertIn("1 mm", window.preview.measure_readout.text())
+
+        bounds = window.preview.profile_bounds()
+        coordinates, values, label = integrated_profile(
+            window.preview._current_image,
+            bounds,
+            integration=window.preview.profile_orientation_combo.currentData(),
+            statistic=window.preview.profile_stat_combo.currentData(),
+        )
+        self.assertEqual(values.size, bounds[2])
+        self.assertEqual(coordinates.size, values.size)
+        self.assertEqual(label, "X pixel")
+        window.preview.profile_orientation_combo.setCurrentIndex(1)
+        window.preview.profile_stat_combo.setCurrentIndex(1)
+        coordinates, values, label = integrated_profile(
+            window.preview._current_image,
+            bounds,
+            integration=window.preview.profile_orientation_combo.currentData(),
+            statistic=window.preview.profile_stat_combo.currentData(),
+        )
+        self.assertEqual(values.size, bounds[3])
+        self.assertEqual(coordinates.size, values.size)
+        self.assertEqual(label, "Y pixel")
+        window.close()
+        self.app.processEvents()
+
+    def test_aaa_queue_runs_multiprocessing_from_background_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {}
+            for name, value in (("white", 100.0), ("dark", 0.0), ("sample", 50.0)):
+                path = root / f"{name}_0000.tif"
+                tifffile.imwrite(path, np.full((8, 8), value, dtype=np.float32))
+                paths[name] = str(path)
+            config = ReductionConfig(
+                white_files=(paths["white"],),
+                dark_files=(paths["dark"],),
+                sample_files=(paths["sample"],),
+                merge_method="median",
+                gamma_filter=False,
+                use_multiprocessing=True,
+                process_count=2,
+            )
+            queue = ReductionQueue()
+            event_loop = QtCore.QEventLoop()
+            results = []
+            failures = []
+            queue.succeeded.connect(
+                lambda _job, result: (results.append(result), event_loop.quit())
+            )
+            queue.failed.connect(
+                lambda _job, message, trace: (failures.append((message, trace)), event_loop.quit())
+            )
+            timeout = QtCore.QTimer()
+            timeout.setSingleShot(True)
+            timeout.timeout.connect(event_loop.quit)
+            timeout.start(20_000)
+            queue.submit(config)
+            event_loop.exec_()
+            queue.shutdown()
+            self.assertFalse(failures, failures[0][1] if failures else "")
+            self.assertTrue(results, "Multiprocessing reduction timed out")
+            np.testing.assert_allclose(results[0].products["sample"].transmission, 0.5)
 
     def test_viewer_controls_without_side_histogram(self):
         window = MainWindow()

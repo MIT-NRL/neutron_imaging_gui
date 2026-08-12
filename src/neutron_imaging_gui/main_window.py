@@ -4,12 +4,23 @@ from __future__ import annotations
 
 from pathlib import Path
 import logging
+import os
 
 import numpy as np
-import tifffile
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .processing import ReductionConfig, ReductionResult, group_repeated_files, load_image
+from .export_dialogs import BatchExportDialog, CurrentImageExportDialog
+from .exporting import (
+    build_export_manifest,
+    crop_image,
+    export_reduction_batch,
+    image_export_metadata,
+    safe_name,
+    write_json,
+    write_png,
+    write_tiff,
+)
 from .widgets import FileSelectionCard, ImagePreview, StepList
 from .workers import ReductionQueue
 
@@ -36,6 +47,7 @@ QProgressBar { min-height: 18px; text-align: center; }
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, initial_sample_paths=(), parent=None):
         super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setWindowTitle("Neutron Imaging Reduction")
         self.resize(1500, 850)
         self.setMinimumSize(1450, 700)
@@ -47,6 +59,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_mode = "raw"
         self._shared_roi = (10, 10, 100, 100)
         self._group_rois: dict[str, tuple[int, int, int, int]] = {}
+        self._last_directory = Path.home()
         self._queue = ReductionQueue(self)
         self._build_ui()
         self._connect_signals()
@@ -65,11 +78,30 @@ class MainWindow(QtWidgets.QMainWindow):
         header_layout = QtWidgets.QVBoxLayout(header)
         header_layout.setContentsMargins(24, 14, 24, 14)
         title = QtWidgets.QLabel("Neutron Imaging Reduction", objectName="title")
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.multiprocessing_check = QtWidgets.QCheckBox("Background processes")
+        self.multiprocessing_check.setChecked(True)
+        self.multiprocessing_check.setToolTip(
+            "Prepare independent white, dark, and sample groups in separate processes."
+        )
+        self.process_count_label = QtWidgets.QLabel("Cores")
+        self.process_count_spin = QtWidgets.QSpinBox()
+        self.process_count_spin.setRange(1, max(1, os.cpu_count() or 1))
+        self.process_count_spin.setValue(min(4, self.process_count_spin.maximum()))
+        self.process_count_spin.setToolTip(
+            "Maximum background processes. Native worker threads are limited "
+            "to avoid oversubscription."
+        )
+        title_row.addWidget(self.multiprocessing_check)
+        title_row.addWidget(self.process_count_label)
+        title_row.addWidget(self.process_count_spin)
         subtitle = QtWidgets.QLabel(
             "Build references, combine repeated exposures, normalize transmission, and inspect attenuation.",
             objectName="subtitle",
         )
-        header_layout.addWidget(title)
+        header_layout.addLayout(title_row)
         header_layout.addWidget(subtitle)
         root.addWidget(header)
 
@@ -212,7 +244,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(group)
 
         note = QtWidgets.QLabel(
-            "Jobs run through a single FIFO worker lane. This bounds memory and disk pressure while keeping the interface responsive."
+            "Reduction jobs stay in one FIFO lane. Within the active job, independent "
+            "reference and sample groups can use the background-process budget selected above."
         )
         note.setWordWrap(True)
         note.setProperty("muted", True)
@@ -287,7 +320,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.summary)
         export_group = QtWidgets.QGroupBox("Export")
         export_layout = QtWidgets.QHBoxLayout(export_group)
-        self.export_selected_button = QtWidgets.QPushButton("Export displayed TIFF…")
+        self.export_selected_button = QtWidgets.QPushButton("Export current image…")
         self.export_all_button = QtWidgets.QPushButton("Export all results…")
         self.export_selected_button.setEnabled(False)
         self.export_all_button.setEnabled(False)
@@ -301,11 +334,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.steps.currentRowChanged.connect(self._stage_changed)
         for card in (self.white_card, self.dark_card, self.sample_card):
             card.filesChanged.connect(self._update_run_state)
+            card.directoryChanged.connect(self._remember_directory)
             card.previewRequested.connect(
                 lambda path, source=card: self._preview_file(path, source.paths)
             )
         self.sample_card.filesChanged.connect(self._refresh_sample_groups)
         self.combine_scans_check.toggled.connect(self._refresh_sample_groups)
+        self.multiprocessing_check.toggled.connect(self._multiprocessing_toggled)
         self.roi_mode_combo.currentIndexChanged.connect(self._roi_mode_changed)
         self.roi_sample_combo.currentIndexChanged.connect(self._preview_roi_sample)
         self.preview.roiChanged.connect(self._update_roi_label)
@@ -322,6 +357,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue.succeeded.connect(self._job_succeeded)
         self._queue.failed.connect(self._job_failed)
         self._queue.cancelled.connect(self._job_cancelled)
+
+    def _remember_directory(self, directory) -> None:
+        path = Path(directory).expanduser().resolve()
+        self._last_directory = path
+        for card in (self.white_card, self.dark_card, self.sample_card):
+            card.set_last_directory(path)
 
     def _build_config(self) -> ReductionConfig:
         return ReductionConfig(
@@ -342,7 +383,13 @@ class MainWindow(QtWidgets.QMainWindow):
             dose_statistic=str(self.dose_stat_combo.currentData()),
             calculate_attenuation=self.attenuation_check.isChecked(),
             attenuation_clip_min=self.clip_spin.value(),
+            use_multiprocessing=self.multiprocessing_check.isChecked(),
+            process_count=self.process_count_spin.value(),
         )
+
+    def _multiprocessing_toggled(self, enabled):
+        self.process_count_label.setEnabled(enabled)
+        self.process_count_spin.setEnabled(enabled)
 
     def _update_run_state(self):
         ready = bool(self.white_card.paths and self.dark_card.paths and self.sample_card.paths)
@@ -481,7 +528,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{len(config.white_files)} white, {len(config.dark_files)} dark, "
             f"{len(config.sample_files)} sample image(s); merge={config.merge_method}; "
             f"gamma={'on' if config.gamma_filter else 'off'}; "
-            f"combine scans={'on' if config.combine_matching_scans else 'off'}."
+            f"combine scans={'on' if config.combine_matching_scans else 'off'}; "
+            f"processes={config.process_count if config.use_multiprocessing else 1}."
         )
         self._current_job_id = self._queue.submit(config)
         self.run_button.setEnabled(False)
@@ -565,6 +613,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Combine matching scans: {'on' if result.config.combine_matching_scans else 'off'}",
             f"Merge method: {result.config.merge_method}",
             f"Gamma filter: {'on' if result.config.gamma_filter else 'off'}",
+            f"Background processes: "
+            f"{result.config.process_count if result.config.use_multiprocessing else 'off'}",
             f"Dose normalization: {'on' if result.config.dose_normalization else 'off'}",
             "",
         ]
@@ -597,32 +647,101 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _export_selected(self):
         array, name = self._selected_array()
-        if array is None:
+        if array is None or self._result is None:
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export displayed image", f"{name}.tif", "TIFF image (*.tif *.tiff)"
+        profile_bounds = (
+            self.preview.profile_bounds() if self.preview.profile_check.isChecked() else None
         )
-        if path:
-            tifffile.imwrite(path, np.asarray(array, dtype=np.float32))
-            self.status_label.setText(f"Saved {path}")
+        dialog = CurrentImageExportDialog(
+            image=array,
+            image_name=safe_name(name),
+            initial_directory=self._last_directory,
+            colormap=str(self.preview.colormap_combo.currentData()),
+            viewer_levels=self.preview.levels(),
+            profile_bounds=profile_bounds,
+            parent=self,
+        )
+        dialog.directorySelected.connect(self._remember_directory)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        options = dialog.options()
+        try:
+            exported = crop_image(array, options.crop_bounds)
+            manifest = build_export_manifest(self._result)
+            metadata = image_export_metadata(
+                manifest,
+                name,
+                exported,
+                crop_bounds=options.crop_bounds,
+            )
+            if options.format == "tiff":
+                write_tiff(
+                    options.path,
+                    exported,
+                    metadata if options.embed_tiff_metadata else None,
+                )
+            else:
+                levels = self.preview.levels() if options.use_viewer_levels else None
+                write_png(
+                    options.path,
+                    exported,
+                    cmap=options.cmap,
+                    levels=levels,
+                    styled=options.format == "png_styled",
+                    colorbar=options.colorbar,
+                    title=options.title,
+                    dpi=options.dpi,
+                )
+            if options.companion_json:
+                payload = dict(manifest)
+                payload["export"] = metadata
+                write_json(options.path.with_suffix(".json"), payload)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self._remember_directory(options.path.parent)
+        self.status_label.setText(f"Saved {options.path}")
 
     def _export_all(self):
         if self._result is None:
             return
-        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Export result directory")
-        if not directory:
+        dialog = BatchExportDialog(
+            initial_directory=self._last_directory,
+            parent=self,
+        )
+        dialog.directorySelected.connect(self._remember_directory)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
-        root = Path(directory)
-        tifffile.imwrite(root / "reference_white.tif", self._result.white.astype(np.float32))
-        tifffile.imwrite(root / "reference_dark.tif", self._result.dark.astype(np.float32))
-        for name, product in self._result.products.items():
-            safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in name)
-            tifffile.imwrite(root / f"{safe_name}_combined.tif", product.combined.astype(np.float32))
-            tifffile.imwrite(root / f"{safe_name}_transmission.tif", product.transmission.astype(np.float32))
-            if product.attenuation is not None:
-                tifffile.imwrite(root / f"{safe_name}_attenuation.tif", product.attenuation.astype(np.float32))
-        self.status_label.setText(f"Exported results to {directory}")
+        options = dialog.options()
+        if not options.categories:
+            QtWidgets.QMessageBox.warning(self, "Nothing to export", "Select at least one product.")
+            return
+        try:
+            exported = export_reduction_batch(
+                self._result,
+                options.directory,
+                categories=options.categories,
+                use_subfolders=options.use_subfolders,
+                embed_tiff_metadata=options.embed_tiff_metadata,
+                companion_json=options.companion_json,
+                overwrite=options.overwrite,
+            )
+        except FileExistsError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export files already exist",
+                str(exc),
+            )
+            return
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self._remember_directory(options.directory)
+        self.status_label.setText(
+            f"Exported {len(exported['files'])} image(s) to {options.directory}"
+        )
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        self.preview.prepare_close()
         self._queue.shutdown()
         super().closeEvent(event)

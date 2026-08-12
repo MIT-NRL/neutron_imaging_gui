@@ -11,13 +11,80 @@ from qtpy import QtCore, QtWidgets
 from .processing import discover_tiffs
 
 
+def integrated_profile(image, bounds, *, integration="vertical", statistic="mean"):
+    """Return an X or Y profile from a rectangular image region.
+
+    Vertical integration collapses rows and returns an X profile. Horizontal
+    integration collapses columns and returns a Y profile.
+    """
+    array = np.asarray(image, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError("Profile input must be a 2D image.")
+    x, y, width, height = (int(round(value)) for value in bounds)
+    x0, y0 = max(0, x), max(0, y)
+    x1 = min(array.shape[1], x + max(1, width))
+    y1 = min(array.shape[0], y + max(1, height))
+    if x1 <= x0 or y1 <= y0:
+        return np.array([], dtype=float), np.array([], dtype=float), "X pixel"
+    region = array[y0:y1, x0:x1]
+    direction = str(integration).strip().lower()
+    reduction = str(statistic).strip().lower()
+    if reduction not in {"mean", "sum"}:
+        raise ValueError("Profile statistic must be 'mean' or 'sum'.")
+    reducer = np.nanmean if reduction == "mean" else np.nansum
+    if direction.startswith("h"):
+        return (
+            np.arange(y0, y1, dtype=float),
+            np.asarray(reducer(region, axis=1), dtype=float),
+            "Y pixel",
+        )
+    return (
+        np.arange(x0, x1, dtype=float),
+        np.asarray(reducer(region, axis=0), dtype=float),
+        "X pixel",
+    )
+
+
+class CalibrationDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calibrate distance")
+        layout = QtWidgets.QFormLayout(self)
+        self.distance_spin = QtWidgets.QDoubleSpinBox()
+        self.distance_spin.setDecimals(6)
+        self.distance_spin.setRange(1e-9, 1e12)
+        self.distance_spin.setValue(1.0)
+        self.distance_spin.selectAll()
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.addItem("µm", 1.0)
+        self.unit_combo.addItem("mm", 1000.0)
+        self.unit_combo.addItem("cm", 10_000.0)
+        unit_row = QtWidgets.QWidget()
+        unit_layout = QtWidgets.QHBoxLayout(unit_row)
+        unit_layout.setContentsMargins(0, 0, 0, 0)
+        unit_layout.addWidget(self.distance_spin, 1)
+        unit_layout.addWidget(self.unit_combo)
+        layout.addRow("Known line length", unit_row)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def distance_um(self):
+        return float(self.distance_spin.value()) * float(self.unit_combo.currentData())
+
+
 class FileSelectionCard(QtWidgets.QGroupBox):
     filesChanged = QtCore.Signal()
     previewRequested = QtCore.Signal(str)
+    directoryChanged = QtCore.Signal(str)
 
     def __init__(self, title: str, description: str, parent=None):
         super().__init__(title, parent)
         self._paths: list[str] = []
+        self._last_directory = str(Path.home())
         layout = QtWidgets.QVBoxLayout(self)
         label = QtWidgets.QLabel(description)
         label.setWordWrap(True)
@@ -61,7 +128,16 @@ class FileSelectionCard(QtWidgets.QGroupBox):
     def add_paths(self, values) -> None:
         merged = discover_tiffs([*self._paths, *values])
         self._paths = merged
+        if self._paths:
+            self._remember_directory(Path(self._paths[-1]).parent)
         self._refresh(select_first=True)
+
+    def set_last_directory(self, directory) -> None:
+        self._last_directory = str(Path(directory).expanduser().resolve())
+
+    def _remember_directory(self, directory) -> None:
+        self.set_last_directory(directory)
+        self.directoryChanged.emit(self._last_directory)
 
     def clear(self) -> None:
         self._paths = []
@@ -69,14 +145,21 @@ class FileSelectionCard(QtWidgets.QGroupBox):
 
     def _choose_files(self) -> None:
         values, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Select TIFF images", "", "TIFF images (*.tif *.tiff)"
+            self,
+            "Select TIFF images",
+            self._last_directory,
+            "TIFF images (*.tif *.tiff)",
         )
         if values:
+            self._remember_directory(Path(values[0]).parent)
             self.add_paths(values)
 
     def _choose_folder(self) -> None:
-        value = QtWidgets.QFileDialog.getExistingDirectory(self, "Select image folder")
+        value = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select image folder", self._last_directory
+        )
         if value:
+            self._remember_directory(value)
             self.add_paths([value])
 
     def _refresh(self, *, select_first=False) -> None:
@@ -109,6 +192,19 @@ class ImagePreview(QtWidgets.QWidget):
         self._histogram_user_view_active = False
         self._histogram_default_range = (0.0, 1.0)
         self._histogram_normalized = False
+        self._measure_drag_active = False
+        self._measure_start_point = None
+        self._measure_points = None
+        self._profile_roi_initialized = False
+        self._profile_popup = None
+        self._profile_plot = None
+        self._profile_curve = None
+        self._profile_coordinates = np.array([], dtype=float)
+        self._profile_values = np.array([], dtype=float)
+        self._profile_update_timer = QtCore.QTimer(self)
+        self._profile_update_timer.setSingleShot(True)
+        self._profile_update_timer.setInterval(40)
+        self._profile_update_timer.timeout.connect(self._update_profile_plot)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.view = pg.ImageView(view=pg.PlotItem())
@@ -119,6 +215,7 @@ class ImagePreview(QtWidgets.QWidget):
             self.view.ui.roiBtn.hide()
             self.view.ui.menuBtn.hide()
         scene = self.view.getView().scene()
+        self._measure_scene = scene
         if scene is not None and hasattr(scene, "sigMouseClicked"):
             scene.sigMouseClicked.connect(self._scene_mouse_clicked)
         layout.addWidget(self.view, 1)
@@ -128,6 +225,29 @@ class ImagePreview(QtWidgets.QWidget):
         self.view.getView().addItem(self.roi)
         self.roi.hide()
         self.roi.sigRegionChangeFinished.connect(lambda: self.roiChanged.emit(self.roi_bounds()))
+
+        self.measure_line = pg.PlotCurveItem(pen=pg.mkPen("#ff9f1c", width=2))
+        self.view.getView().addItem(self.measure_line, ignoreBounds=True)
+        self.measure_line.hide()
+
+        self.profile_roi = pg.RectROI(
+            (10, 10),
+            (100, 100),
+            pen=pg.mkPen("#00b4d8", width=2),
+            movable=True,
+            rotatable=False,
+            removable=False,
+            resizable=True,
+        )
+        self.profile_roi.addScaleHandle((1, 1), (0, 0))
+        self.profile_roi.addScaleHandle((0, 0), (1, 1))
+        self.view.getView().addItem(self.profile_roi, ignoreBounds=True)
+        self.profile_roi.hide()
+        self.profile_roi.sigRegionChanged.connect(self._schedule_profile_update)
+        self.profile_roi.sigRegionChangeFinished.connect(self._update_profile_plot)
+
+        analysis_panel = self._build_analysis_panel()
+        layout.insertWidget(0, analysis_panel)
         self.caption = QtWidgets.QLabel("No image selected")
         self.caption.setWordWrap(True)
         layout.addWidget(self.caption)
@@ -332,8 +452,266 @@ class ImagePreview(QtWidgets.QWidget):
         self.colormap_combo.currentIndexChanged.connect(self._apply_colormap)
         self._auto_levels_toggled(True)
 
+    def _build_analysis_panel(self):
+        panel = QtWidgets.QGroupBox("Analysis")
+        row = QtWidgets.QHBoxLayout(panel)
+        row.setContentsMargins(8, 3, 8, 3)
+        row.setSpacing(7)
+
+        self.measure_check = QtWidgets.QCheckBox("Line")
+        self.measure_check.setToolTip("Drag across the image to draw a measurement line.")
+        self.measure_readout = QtWidgets.QLabel("-- px")
+        self.measure_readout.setFixedWidth(130)
+        self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
+        self.pixel_size_spin.setDecimals(6)
+        self.pixel_size_spin.setRange(0.0, 1e9)
+        self.pixel_size_spin.setSingleStep(1.0)
+        self.pixel_size_spin.setSpecialValueText("Not set")
+        self.pixel_size_spin.setSuffix(" µm/px")
+        self.pixel_size_spin.setFixedWidth(108)
+        self.pixel_size_spin.setToolTip(
+            "Physical pixel size. Enter it directly or calibrate it from the measurement line."
+        )
+        self.calibrate_button = QtWidgets.QPushButton("Calibrate")
+        self.calibrate_button.setFixedWidth(94)
+        self.calibrate_button.setEnabled(False)
+        self.calibrate_button.setToolTip(
+            "Set the physical pixel size from the line and a known physical distance."
+        )
+
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.VLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+
+        self.profile_check = QtWidgets.QCheckBox("Profile")
+        self.profile_check.setToolTip("Show a blue integration ROI and its live profile plot.")
+        self.profile_orientation_combo = QtWidgets.QComboBox()
+        self.profile_orientation_combo.addItem("Vertical → X", "vertical")
+        self.profile_orientation_combo.addItem("Horizontal → Y", "horizontal")
+        self.profile_orientation_combo.setFixedWidth(145)
+        self.profile_orientation_combo.setToolTip(
+            "Vertical integration collapses rows; horizontal integration collapses columns."
+        )
+        self.profile_stat_combo = QtWidgets.QComboBox()
+        self.profile_stat_combo.addItem("Mean", "mean")
+        self.profile_stat_combo.addItem("Sum", "sum")
+        self.profile_stat_combo.setFixedWidth(68)
+        self.profile_stat_combo.setToolTip("Choose averaging or summed integration.")
+
+        row.addWidget(self.measure_check)
+        row.addWidget(self.measure_readout)
+        row.addWidget(QtWidgets.QLabel("Scale"))
+        row.addWidget(self.pixel_size_spin)
+        row.addWidget(self.calibrate_button)
+        row.addWidget(separator)
+        row.addWidget(self.profile_check)
+        row.addWidget(self.profile_orientation_combo)
+        row.addWidget(self.profile_stat_combo)
+        row.addStretch(1)
+        panel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        self.measure_check.toggled.connect(self._measurement_toggled)
+        self.pixel_size_spin.valueChanged.connect(self._calibration_changed)
+        self.calibrate_button.clicked.connect(self._show_calibration_dialog)
+        self.profile_check.toggled.connect(self._profile_toggled)
+        self.profile_orientation_combo.currentIndexChanged.connect(self._update_profile_plot)
+        self.profile_stat_combo.currentIndexChanged.connect(self._update_profile_plot)
+        return panel
+
+    def _initialize_analysis_overlays(self, *, force=False):
+        if self._current_image is None:
+            return
+        height, width = self._current_image.shape
+        if force or not self._profile_roi_initialized:
+            roi_width = max(2.0, width * 0.5)
+            roi_height = max(2.0, height * 0.25)
+            previous = self.profile_roi.blockSignals(True)
+            self.profile_roi.setPos(
+                ((width - roi_width) * 0.5, (height - roi_height) * 0.5),
+                update=False,
+            )
+            self.profile_roi.setSize((roi_width, roi_height), update=True)
+            self.profile_roi.blockSignals(previous)
+            self._profile_roi_initialized = True
+        self._update_measurement()
+        if self.profile_check.isChecked():
+            self._update_profile_plot()
+
+    def _measurement_points(self):
+        return [] if self._measure_points is None else list(self._measure_points)
+
+    def measurement_length_px(self):
+        points = self._measurement_points()
+        if len(points) != 2:
+            return None
+        length = float(
+            np.hypot(points[1].x() - points[0].x(), points[1].y() - points[0].y())
+        )
+        return length if np.isfinite(length) and length > 0 else None
+
+    def _measurement_toggled(self, enabled):
+        self._set_measure_interaction_enabled(enabled)
+        if not enabled:
+            self._clear_measurement()
+        self.calibrate_button.setEnabled(bool(enabled and self.measurement_length_px()))
+        self._update_measurement()
+
+    def _set_measure_interaction_enabled(self, enabled):
+        view_box = self.view.getView()
+        view_box.setMouseEnabled(x=not enabled, y=not enabled)
+        if self._measure_scene is None:
+            return
+        self._measure_scene.removeEventFilter(self)
+        if enabled:
+            self._measure_scene.installEventFilter(self)
+
+    def prepare_close(self):
+        """Detach scene hooks before Qt tears down the graphics scene."""
+        self._measure_drag_active = False
+        self._measure_start_point = None
+        if self._measure_scene is not None:
+            self._measure_scene.removeEventFilter(self)
+
+    def _clear_measurement(self):
+        self._measure_drag_active = False
+        self._measure_start_point = None
+        self._measure_points = None
+        self.measure_line.setData([], [])
+        self.measure_line.hide()
+
+    def _map_scene_to_image_point(self, scene_position):
+        try:
+            view_box = self.view.getView().getViewBox()
+            return QtCore.QPointF(view_box.mapSceneToView(scene_position))
+        except Exception:
+            return None
+
+    def _update_measure_line(self, start_point, end_point):
+        if start_point is None or end_point is None:
+            return
+        start = QtCore.QPointF(start_point)
+        end = QtCore.QPointF(end_point)
+        self._measure_points = (start, end)
+        self.measure_line.setData([start.x(), end.x()], [start.y(), end.y()])
+        self.measure_line.show()
+        self._update_measurement()
+
+    def _update_measurement(self, *_args):
+        length_px = self.measurement_length_px()
+        if length_px is None or self._current_image is None:
+            self.measure_readout.setText("-- px")
+            self.measure_readout.setToolTip("Enable Line, then drag across the image to measure.")
+            self.calibrate_button.setEnabled(False)
+            return
+        pixel_size_um = float(self.pixel_size_spin.value())
+        text = f"{length_px:.2f} px"
+        tooltip = text
+        if pixel_size_um > 0:
+            length_um = length_px * pixel_size_um
+            physical = f"{length_um:.3g} µm" if length_um < 1000 else f"{length_um / 1000:.4g} mm"
+            text = f"{length_px:.2f} px / {physical}"
+            tooltip = (
+                f"{length_px:.6g} pixels × {pixel_size_um:.6g} µm/pixel = "
+                f"{length_um:.6g} µm"
+            )
+        self.measure_readout.setText(text)
+        self.measure_readout.setToolTip(tooltip)
+        self.calibrate_button.setEnabled(self.measure_check.isChecked())
+
+    def set_calibration_from_line(self, distance_um):
+        length_px = self.measurement_length_px()
+        distance_um = float(distance_um)
+        if length_px is None or not np.isfinite(distance_um) or distance_um <= 0:
+            raise ValueError("Calibration requires a valid line and positive distance.")
+        self.pixel_size_spin.setValue(distance_um / length_px)
+        return float(self.pixel_size_spin.value())
+
+    def _show_calibration_dialog(self):
+        if self.measurement_length_px() is None:
+            return
+        dialog = CalibrationDialog(self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.set_calibration_from_line(dialog.distance_um())
+
+    def _calibration_changed(self, *_args):
+        self._update_measurement()
+        if self.profile_check.isChecked():
+            self._update_profile_plot()
+
+    def profile_bounds(self):
+        if self._current_image is None:
+            return (0, 0, 0, 0)
+        height, width = self._current_image.shape
+        pos = self.profile_roi.pos()
+        size = self.profile_roi.size()
+        x0 = max(0, min(width, int(np.floor(min(pos.x(), pos.x() + size.x())))))
+        x1 = max(0, min(width, int(np.ceil(max(pos.x(), pos.x() + size.x())))))
+        y0 = max(0, min(height, int(np.floor(min(pos.y(), pos.y() + size.y())))))
+        y1 = max(0, min(height, int(np.ceil(max(pos.y(), pos.y() + size.y())))))
+        return (x0, y0, max(0, x1 - x0), max(0, y1 - y0))
+
+    def _ensure_profile_popup(self):
+        if self._profile_popup is not None:
+            return
+        popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
+        popup.setWindowTitle("Image Profile")
+        popup.resize(600, 360)
+        popup.installEventFilter(self)
+        popup_layout = QtWidgets.QVBoxLayout(popup)
+        self._profile_plot = pg.PlotWidget()
+        self._profile_plot.showGrid(x=True, y=True, alpha=0.2)
+        self._profile_curve = self._profile_plot.plot(pen=pg.mkPen("#0077b6", width=2))
+        popup_layout.addWidget(self._profile_plot, 1)
+        self.profile_roi_label = QtWidgets.QLabel("ROI: --")
+        popup_layout.addWidget(self.profile_roi_label)
+        self._profile_popup = popup
+
+    def _profile_toggled(self, enabled):
+        self._initialize_analysis_overlays()
+        self.profile_roi.setVisible(bool(enabled and self._current_image is not None))
+        if enabled:
+            self._ensure_profile_popup()
+            self._profile_popup.show()
+            self._profile_popup.raise_()
+            self._update_profile_plot()
+        elif self._profile_popup is not None:
+            self._profile_popup.hide()
+
+    def _schedule_profile_update(self, *_args):
+        if self.profile_check.isChecked():
+            self._profile_update_timer.start()
+
+    def _update_profile_plot(self, *_args):
+        if not self.profile_check.isChecked() or self._current_image is None:
+            return
+        self._ensure_profile_popup()
+        bounds = self.profile_bounds()
+        coordinates, values, axis_label = integrated_profile(
+            self._current_image,
+            bounds,
+            integration=self.profile_orientation_combo.currentData(),
+            statistic=self.profile_stat_combo.currentData(),
+        )
+        pixel_size_um = float(self.pixel_size_spin.value())
+        if pixel_size_um > 0 and coordinates.size:
+            coordinates = coordinates * pixel_size_um
+            axis_label = f"{axis_label[0]} distance (µm)"
+        self._profile_coordinates = coordinates
+        self._profile_values = values
+        self._profile_curve.setData(coordinates, values)
+        plot_item = self._profile_plot.getPlotItem()
+        statistic = str(self.profile_stat_combo.currentData())
+        plot_item.setLabel("bottom", axis_label)
+        plot_item.setLabel("left", "Mean intensity" if statistic == "mean" else "Integrated intensity")
+        plot_item.enableAutoRange(axis="xy", enable=True)
+        x, y, width, height = bounds
+        self.profile_roi_label.setText(
+            f"ROI: x={x}:{x + width}, y={y}:{y + height} · {width} × {height} px"
+        )
+
     def set_image(self, image: np.ndarray, caption: str = "") -> None:
         array = np.asarray(image, dtype=np.float32)
+        previous_shape = None if self._current_image is None else self._current_image.shape
         self._current_image = array
         self._configure_level_controls(array)
         levels = self._auto_level_values(array) if self.auto_levels_check.isChecked() else self.levels()
@@ -341,6 +719,11 @@ class ImagePreview(QtWidgets.QWidget):
         self._apply_colormap()
         self._update_histogram(array)
         self.caption.setText(caption or f"{array.shape[1]} × {array.shape[0]}")
+        self._initialize_analysis_overlays(force=previous_shape != array.shape)
+        self.measure_line.setVisible(
+            self.measure_check.isChecked() and self.measurement_length_px() is not None
+        )
+        self.profile_roi.setVisible(self.profile_check.isChecked())
         if self.auto_levels_check.isChecked():
             QtCore.QTimer.singleShot(0, self.apply_auto_levels)
 
@@ -695,6 +1078,47 @@ class ImagePreview(QtWidgets.QWidget):
         self._set_histogram_axis_ticks(low, high)
 
     def eventFilter(self, watched, event):
+        if watched is self._measure_scene and self.measure_check.isChecked():
+            event_type = event.type()
+            if event_type == QtCore.QEvent.GraphicsSceneMousePress:
+                try:
+                    if event.button() != QtCore.Qt.LeftButton or self._current_image is None:
+                        return False
+                    point = self._map_scene_to_image_point(event.scenePos())
+                    if point is None:
+                        return False
+                    self._measure_drag_active = True
+                    self._measure_start_point = point
+                    self._update_measure_line(point, point)
+                    event.accept()
+                    return True
+                except Exception:
+                    return False
+            if event_type == QtCore.QEvent.GraphicsSceneMouseMove and self._measure_drag_active:
+                point = self._map_scene_to_image_point(event.scenePos())
+                if point is not None and self._measure_start_point is not None:
+                    self._update_measure_line(self._measure_start_point, point)
+                event.accept()
+                return True
+            if event_type == QtCore.QEvent.GraphicsSceneMouseRelease and self._measure_drag_active:
+                try:
+                    if event.button() != QtCore.Qt.LeftButton:
+                        return False
+                    point = self._map_scene_to_image_point(event.scenePos())
+                    if point is not None and self._measure_start_point is not None:
+                        self._update_measure_line(self._measure_start_point, point)
+                    self._measure_drag_active = False
+                    self._measure_start_point = None
+                    event.accept()
+                    return True
+                except Exception:
+                    self._measure_drag_active = False
+                    self._measure_start_point = None
+                    return True
+        if watched is self._profile_popup and event.type() == QtCore.QEvent.Close:
+            if self.profile_check.isChecked():
+                self.profile_check.setChecked(False)
+            return False
         if watched is self._histogram_viewport:
             event_type = event.type()
             if event_type == QtCore.QEvent.Resize:
