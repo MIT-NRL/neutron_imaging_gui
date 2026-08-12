@@ -1,0 +1,54 @@
+{% set name = "neutron-imaging-gui" %}
+{% set pyproject = load_file_data("../pyproject.toml", from_recipe_dir=True) %}
+{% set version = pyproject["project"]["version"] %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  noarch: python
+  number: 0
+  script: "{{ PYTHON }} -m pip install . --no-deps --no-build-isolation"
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - setuptools >=68
+    - wheel
+  run:
+    - python >=3.10
+    - matplotlib
+    - neutron-imaging-tools >=0.2.5
+    - numpy
+    - pyqt >=5.15,<6
+    - pyqtgraph
+    - qtpy
+    - threadpoolctl
+    - tifffile
+
+test:
+  imports:
+    - neutron_imaging_gui
+    - neutron_imaging_gui.application
+  commands:
+    - neutron-imaging-gui --help
+
+about:
+  home: https://github.com/MIT-NRL/neutron_imaging_gui
+  dev_url: https://github.com/MIT-NRL/neutron_imaging_gui
+  summary: Interactive neutron radiography reduction and tomography preparation GUI.
+  description: |
+    A Qt application for neutron radiography reduction, image inspection and
+    export, tomography preparation, reconstruction trials, and portable recipe
+    generation for cluster reconstruction workflows.
+  license: BSD-3-Clause
+  license_file: LICENSE
+
+extra:
+  recipe-maintainers:
+    - seanfayfar

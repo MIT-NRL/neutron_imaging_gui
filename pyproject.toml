@@ -7,6 +7,8 @@ name = "neutron-imaging-gui"
 version = "0.2.0"
 description = "Interactive neutron-imaging data reduction workflow."
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Sean Fayfar", email = "sfayfar@mit.edu" }]
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib",
@@ -24,6 +26,11 @@ tomography = ["tomopy"]
 
 [project.scripts]
 neutron-imaging-gui = "neutron_imaging_gui.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/MIT-NRL/neutron_imaging_gui"
+Repository = "https://github.com/MIT-NRL/neutron_imaging_gui"
+Issues = "https://github.com/MIT-NRL/neutron_imaging_gui/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

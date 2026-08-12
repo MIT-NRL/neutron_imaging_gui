@@ -77,6 +77,58 @@ python -m pip install -e .
 neutron-imaging-gui
 ```
 
+## Conda package
+
+The repository includes a `noarch: python` recipe in `conda.recipe`. The GUI
+depends on `neutron-imaging-tools >=0.2.5`, which is not currently available on
+conda-forge. NIT is published in the `seanfayfar` Anaconda.org channel.
+
+Build the GUI without automatically uploading:
+
+```bash
+conda build conda.recipe \
+  --no-anaconda-upload \
+  --override-channels \
+  -c seanfayfar \
+  -c conda-forge
+```
+
+The build ends by printing the `.conda` artifact path. Test that artifact in a
+clean environment before upload:
+
+```bash
+conda create -n neutron-imaging-gui-test \
+  --override-channels \
+  -c local \
+  -c seanfayfar \
+  -c conda-forge \
+  neutron-imaging-gui
+
+conda run -n neutron-imaging-gui-test neutron-imaging-gui --help
+```
+
+Authenticate specifically with Anaconda.org and upload the artifact only after
+the clean-environment test succeeds:
+
+```bash
+anaconda login --at anaconda.org
+anaconda upload --at anaconda.org /path/to/neutron-imaging-gui-*.conda
+```
+
+After upload, users can install the GUI and its NIT dependency with:
+
+```bash
+conda create -n neutron-imaging-gui \
+  --override-channels \
+  -c seanfayfar \
+  -c conda-forge \
+  neutron-imaging-gui
+```
+
+TomoPy and LEAP are optional reconstruction backends and are intentionally not
+installed by the base GUI package. Install TomoPy separately for CPU tomography
+trials; install LEAP in a suitable GPU environment for LEAP reconstruction.
+
 ## Filename grouping
 
 Sample files ending in an underscore and an integer are treated as repeated
